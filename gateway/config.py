@@ -99,6 +99,12 @@ class PlatformConfig:
     api_key: Optional[str] = None  # API key if different from token
     home_channel: Optional[HomeChannel] = None
     
+    # Reply threading mode (Telegram/Slack)
+    # - "off": Never thread replies to original message
+    # - "first": Only first chunk threads to user's message (default)
+    # - "all": All chunks in multi-part replies thread to user's message
+    reply_to_mode: str = "first"
+    
     # Platform-specific settings
     extra: Dict[str, Any] = field(default_factory=dict)
     
@@ -106,6 +112,7 @@ class PlatformConfig:
         result = {
             "enabled": self.enabled,
             "extra": self.extra,
+            "reply_to_mode": self.reply_to_mode,
         }
         if self.token:
             result["token"] = self.token
@@ -126,6 +133,7 @@ class PlatformConfig:
             token=data.get("token"),
             api_key=data.get("api_key"),
             home_channel=home_channel,
+            reply_to_mode=data.get("reply_to_mode", "first"),
             extra=data.get("extra", {}),
         )
 
@@ -349,6 +357,11 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.platforms[Platform.TELEGRAM] = PlatformConfig()
         config.platforms[Platform.TELEGRAM].enabled = True
         config.platforms[Platform.TELEGRAM].token = telegram_token
+    
+    # Reply threading mode for Telegram (off/first/all)
+    telegram_reply_mode = os.getenv("TELEGRAM_REPLY_TO_MODE", "").lower()
+    if telegram_reply_mode in ("off", "first", "all"):
+        config.platforms[Platform.TELEGRAM].reply_to_mode = telegram_reply_mode
     
     telegram_home = os.getenv("TELEGRAM_HOME_CHANNEL")
     if telegram_home and Platform.TELEGRAM in config.platforms:
