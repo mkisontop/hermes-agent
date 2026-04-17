@@ -729,6 +729,7 @@ def memory_tool(
     target: str = "memory",
     content: str = None,
     old_text: str = None,
+    source: str = "user_explicit",
     store: Optional[MemoryStore] = None,
 ) -> str:
     """
@@ -745,7 +746,7 @@ def memory_tool(
     if action == "add":
         if not content:
             return tool_error("Content is required for 'add' action.", success=False)
-        result = store.add(target, content)
+        result = store.add(target, content, source=source)
 
     elif action == "replace":
         if not old_text:
@@ -797,7 +798,13 @@ MEMORY_SCHEMA = {
         "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
         "remove (delete -- old_text identifies it).\n\n"
-        "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
+        "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state.\n\n"
+        "CONTRADICTION HANDLING: replace() on a high-confidence entry (>= 0.9, < 7 days old) "
+        "quarantines the old entry automatically — you don't have to do anything, but be aware "
+        "that a weekly audit will surface quarantine decisions.\n\n"
+        "SOURCE ATTRIBUTION: For 'add', optionally pass source ('user_explicit', 'user_correction', "
+        "'session_summary', 'agent_inference'). Defaults to 'user_explicit'. This affects decay speed — "
+        "inferred facts decay faster than explicit ones."
     ),
     "parameters": {
         "type": "object",
@@ -820,6 +827,11 @@ MEMORY_SCHEMA = {
                 "type": "string",
                 "description": "Short unique substring identifying the entry to replace or remove."
             },
+            "source": {
+                "type": "string",
+                "enum": ["user_explicit", "user_correction", "session_summary", "agent_inference"],
+                "description": "Provenance — why you're saving this. Affects confidence/decay. Optional, defaults to user_explicit."
+            },
         },
         "required": ["action", "target"],
     },
@@ -838,6 +850,7 @@ registry.register(
         target=args.get("target", "memory"),
         content=args.get("content"),
         old_text=args.get("old_text"),
+        source=args.get("source", "user_explicit"),
         store=kw.get("store")),
     check_fn=check_memory_requirements,
     emoji="🧠",
