@@ -62,6 +62,77 @@ _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 _CHARS_PER_TOKEN = 4
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 
+# Hard ceiling on the memory-snapshot block injected into compaction prompts.
+# Prevents a bloated MEMORY.md from crowding out turn content.
+_MEMORY_SNAPSHOT_MAX_CHARS = 6000
+# Per-store entry caps (prefer most-recent tail — typically highest-confidence
+# because decay/vacuum surfaces survivors to the tail).
+_MEMORY_SNAPSHOT_USER_ENTRIES = 12
+_MEMORY_SNAPSHOT_MEMORY_ENTRIES = 12
+
+
+def _build_memory_snapshot_block() -> str:
+    """Read live USER.md + MEMORY.md and render a compaction-preservation block.
+
+    Returns a labelled block the summarizer LLM is told to copy verbatim into
+    its output, or an empty string if no memory exists or any error occurs.
+
+    Failure-safe by design: compaction runs at high pressure and must never
+    be blocked by a corrupt sidecar or missing file.
+    """
+    try:
+        # Lazy import — avoids circular deps and keeps compressor usable in
+        # test/embedded contexts where memory_tool isn't wired.
+        from tools.memory_tool import MemoryStore  # type: ignore
+
+        store = MemoryStore()
+        # MemoryStore() is empty-init; disk read happens in load_from_disk().
+        try:
+            store.load_from_disk()
+        except Exception:  # noqa: BLE001 — missing dir / corrupt files are OK
+            return ""
+        user_entries: List[str] = []
+        memory_entries: List[str] = []
+        try:
+            raw_user = store._entries_for("user")
+            if raw_user:
+                # Tail = most-recent / survivors after decay passes.
+                user_entries = [e for e in raw_user[-_MEMORY_SNAPSHOT_USER_ENTRIES:] if e]
+        except Exception:  # noqa: BLE001 — never fatal
+            user_entries = []
+        try:
+            raw_mem = store._entries_for("memory")
+            if raw_mem:
+                memory_entries = [e for e in raw_mem[-_MEMORY_SNAPSHOT_MEMORY_ENTRIES:] if e]
+        except Exception:  # noqa: BLE001
+            memory_entries = []
+
+        if not user_entries and not memory_entries:
+            return ""
+
+        lines = [
+            "DURABLE MEMORY SNAPSHOT — preserve verbatim in the '## Durable Memory Snapshot' "
+            "section of your output. Do NOT summarize, paraphrase, or drop items. "
+            "Copy exactly as written below.",
+        ]
+        if user_entries:
+            lines.append("")
+            lines.append("USER profile (who the user is):")
+            for e in user_entries:
+                lines.append(f"- {e}")
+        if memory_entries:
+            lines.append("")
+            lines.append("MEMORY (durable assistant notes):")
+            for e in memory_entries:
+                lines.append(f"- {e}")
+
+        block = "\n".join(lines)
+        if len(block) > _MEMORY_SNAPSHOT_MAX_CHARS:
+            block = block[:_MEMORY_SNAPSHOT_MAX_CHARS] + "\n...[snapshot truncated]"
+        return block
+    except Exception:  # noqa: BLE001 — absolutely must not break compaction
+        return ""
+
 
 def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) -> str:
     """Create an informative 1-line summary of a tool call + result.
@@ -642,15 +713,22 @@ Be specific with file paths, commands, line numbers, and results.]
 ## Critical Context
 [Any specific values, error messages, configuration details, or data that would be lost without explicit preservation]
 
+## Durable Memory Snapshot
+[If a DURABLE MEMORY SNAPSHOT block is included earlier in this prompt, copy it verbatim under this heading — every USER and MEMORY entry exactly as shown. Do NOT paraphrase, summarize, or omit entries. If no such block was provided, write "None."]
+
 Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
 
 Write only the summary body. Do not include any preamble or prefix."""
+
+        # Pull current durable memory so it survives the compaction boundary.
+        _memory_block = _build_memory_snapshot_block()
+        _memory_prefix = f"{_memory_block}\n\n" if _memory_block else ""
 
         if self._previous_summary:
             # Iterative update: preserve existing info, add new progress
             prompt = f"""{_summarizer_preamble}
 
-You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
+{_memory_prefix}You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
 
 PREVIOUS SUMMARY:
 {self._previous_summary}
@@ -665,7 +743,7 @@ Update the summary using this exact structure. PRESERVE all existing information
             # First compaction: summarize from scratch
             prompt = f"""{_summarizer_preamble}
 
-Create a structured handoff summary for a different assistant that will continue this conversation after earlier turns are compacted. The next assistant should be able to understand what happened without re-reading the original turns.
+{_memory_prefix}Create a structured handoff summary for a different assistant that will continue this conversation after earlier turns are compacted. The next assistant should be able to understand what happened without re-reading the original turns.
 
 TURNS TO SUMMARIZE:
 {content_to_summarize}
