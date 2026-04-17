@@ -23,12 +23,14 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
+import hashlib
 import json
 import logging
 import os
 import re
 import tempfile
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
@@ -56,48 +58,76 @@ def get_memory_dir() -> Path:
 
 ENTRY_DELIMITER = "\n§\n"
 
+# ---------------------------------------------------------------------------
+# Metadata sidecar — invisible to the model.
+#
+# Lives next to MEMORY.md / USER.md as MEMORY.meta.json / USER.meta.json and
+# tracks per-entry provenance (id, confidence, first_seen, last_seen,
+# evidence_count, scope, supersedes, source, decayed). The model never reads
+# this file; only MemoryOps / decay / vacuum / summarizer scripts do.
+# ---------------------------------------------------------------------------
+
+META_VERSION = 1
+
+# Default confidence per source. Tune these in one place.
+_DEFAULT_CONFIDENCE_BY_SOURCE = {
+    "user_explicit": 1.0,
+    "user_correction": 1.0,
+    "session_summary": 0.6,
+    "agent_inference": 0.5,
+    "legacy": 0.7,
+}
+
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _hash_id(content: str) -> str:
+    """Short stable id derived from entry content (first 12 hex chars of sha256)."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
+
+
+def _full_hash(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
 
 # ---------------------------------------------------------------------------
 # Memory content scanning — lightweight check for injection/exfiltration
 # in content that gets injected into the system prompt.
 # ---------------------------------------------------------------------------
 
-_MEMORY_THREAT_PATTERNS = [
-    # Prompt injection
-    (r'ignore\s+(previous|all|above|prior)\s+instructions', "prompt_injection"),
-    (r'you\s+are\s+now\s+', "role_hijack"),
-    (r'do\s+not\s+tell\s+the\s+user', "deception_hide"),
-    (r'system\s+prompt\s+override', "sys_prompt_override"),
-    (r'disregard\s+(your|all|any)\s+(instructions|rules|guidelines)', "disregard_rules"),
-    (r'act\s+as\s+(if|though)\s+you\s+(have\s+no|don\'t\s+have)\s+(restrictions|limits|rules)', "bypass_restrictions"),
-    # Exfiltration via curl/wget with secrets
-    (r'curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_curl"),
-    (r'wget\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_wget"),
-    (r'cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)', "read_secrets"),
-    # Persistence via shell rc
-    (r'authorized_keys', "ssh_backdoor"),
-    (r'\$HOME/\.ssh|\~/\.ssh', "ssh_access"),
-    (r'\$HOME/\.hermes/\.env|\~/\.hermes/\.env', "hermes_env"),
-]
-
-# Subset of invisible chars for injection detection
-_INVISIBLE_CHARS = {
-    '\u200b', '\u200c', '\u200d', '\u2060', '\ufeff',
-    '\u202a', '\u202b', '\u202c', '\u202d', '\u202e',
-}
+# Threat + secret scanning live in tools/secret_scanner.py so the summarizer,
+# vacuum, and any other callers can reuse the same patterns without a circular
+# import against MemoryStore. Keep this file the *consumer*, not the source of truth.
+try:
+    from tools.secret_scanner import scan_for_threats, scan_for_secrets
+except ImportError:
+    # Fallback for direct-module execution (e.g. pytest from tools/ dir)
+    from secret_scanner import scan_for_threats, scan_for_secrets  # type: ignore
 
 
 def _scan_memory_content(content: str) -> Optional[str]:
-    """Scan memory content for injection/exfil patterns. Returns error string if blocked."""
-    # Check invisible unicode
-    for char in _INVISIBLE_CHARS:
-        if char in content:
-            return f"Blocked: content contains invisible unicode character U+{ord(char):04X} (possible injection)."
+    """Block prompt-injection, exfil, invisible-unicode, AND secret leakage.
 
-    # Check threat patterns
-    for pattern, pid in _MEMORY_THREAT_PATTERNS:
-        if re.search(pattern, content, re.IGNORECASE):
-            return f"Blocked: content matches threat pattern '{pid}'. Memory entries are injected into the system prompt and must not contain injection or exfiltration payloads."
+    Single gate used by both add() and replace(). Returns error string on block,
+    None if clean. Secrets are a hard block — we do not silently redact, because
+    a user pasting a live key into memory needs to *know* it was rejected so they
+    can rotate it.
+    """
+    threat_err = scan_for_threats(content)
+    if threat_err:
+        return threat_err
+
+    hits = scan_for_secrets(content)
+    if hits:
+        kinds = sorted({h["kind"] for h in hits})
+        return (
+            f"Blocked: content contains {len(hits)} secret-shaped token(s) "
+            f"({', '.join(kinds)}). Memory is injected into the system prompt — "
+            f"never store live credentials. Rotate the leaked token(s) and retry "
+            f"with a redacted version."
+        )
 
     return None
 
@@ -138,6 +168,13 @@ class MemoryStore:
             "memory": self._render_block("memory", self.memory_entries),
             "user": self._render_block("user", self.user_entries),
         }
+
+        # Backfill metadata for any entries without a sidecar record
+        try:
+            self._backfill_meta("memory")
+            self._backfill_meta("user")
+        except Exception as e:
+            logger.warning("Meta backfill failed (non-fatal): %s", e)
 
     @staticmethod
     @contextmanager
@@ -219,6 +256,158 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
+    # -----------------------------------------------------------------
+    # Metadata sidecar (MEMORY.meta.json / USER.meta.json)
+    # -----------------------------------------------------------------
+
+    def _meta_path(self, target: str) -> Path:
+        mem_dir = get_memory_dir()
+        return mem_dir / ("USER.meta.json" if target == "user" else "MEMORY.meta.json")
+
+    def _empty_meta(self) -> Dict[str, Any]:
+        return {"version": META_VERSION, "entries": {}, "quarantine_log": []}
+
+    def _load_meta(self, target: str) -> Dict[str, Any]:
+        p = self._meta_path(target)
+        if not p.exists():
+            return self._empty_meta()
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            # Future migration hook — for v1 we just ensure required keys exist
+            data.setdefault("version", META_VERSION)
+            data.setdefault("entries", {})
+            data.setdefault("quarantine_log", [])
+            return data
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Corrupt meta file %s (%s), starting fresh", p, e)
+            return self._empty_meta()
+
+    def _save_meta(self, target: str, meta: Dict[str, Any]):
+        p = self._meta_path(target)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(p.parent), suffix=".tmp", prefix=".meta_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, str(p))
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _backfill_meta(self, target: str):
+        """Ensure every entry in the .md has a meta record. Missing ones get source=legacy."""
+        entries = self._entries_for(target)
+        meta = self._load_meta(target)
+        changed = False
+        for text in entries:
+            h = _hash_id(text)
+            if h not in meta["entries"]:
+                now = _iso_now()
+                meta["entries"][h] = {
+                    "content_hash": _full_hash(text),
+                    "confidence": _DEFAULT_CONFIDENCE_BY_SOURCE["legacy"],
+                    "first_seen": now,
+                    "last_seen": now,
+                    "evidence_count": 1,
+                    "scope": "global",
+                    "source": "legacy",
+                    "supersedes": [],
+                    "decayed": False,
+                }
+                changed = True
+        if changed or not self._meta_path(target).exists():
+            # Write at least once on first upgrade even if nothing was added,
+            # but only if the .md file actually exists (otherwise we'd create
+            # an empty meta for a nonexistent store).
+            if entries or self._meta_path(target).exists():
+                self._save_meta(target, meta)
+
+    def _meta_add_entry(
+        self,
+        target: str,
+        content: str,
+        source: str = "user_explicit",
+        confidence: Optional[float] = None,
+        supersedes: Optional[List[str]] = None,
+    ):
+        """Record a new entry or bump evidence on a re-assertion."""
+        meta = self._load_meta(target)
+        h = _hash_id(content)
+        now = _iso_now()
+        if h in meta["entries"]:
+            # Re-assertion — duplicate in the .md, but still a signal.
+            e = meta["entries"][h]
+            e["evidence_count"] = int(e.get("evidence_count", 1)) + 1
+            e["last_seen"] = now
+            # Bump confidence, capped at 1.0
+            e["confidence"] = min(1.0, float(e.get("confidence", 0.7)) + 0.05)
+        else:
+            resolved_conf = (
+                confidence
+                if confidence is not None
+                else _DEFAULT_CONFIDENCE_BY_SOURCE.get(source, 0.6)
+            )
+            meta["entries"][h] = {
+                "content_hash": _full_hash(content),
+                "confidence": resolved_conf,
+                "first_seen": now,
+                "last_seen": now,
+                "evidence_count": 1,
+                "scope": "global",
+                "source": source,
+                "supersedes": list(supersedes) if supersedes else [],
+                "decayed": False,
+            }
+        self._save_meta(target, meta)
+
+    def _meta_remove_entry(self, target: str, content: str):
+        meta = self._load_meta(target)
+        h = _hash_id(content)
+        if h in meta["entries"]:
+            del meta["entries"][h]
+            self._save_meta(target, meta)
+
+    def _meta_replace_entry(
+        self,
+        target: str,
+        old_content: str,
+        new_content: str,
+        source: str = "user_correction",
+    ):
+        old_h = _hash_id(old_content)
+        new_h = _hash_id(new_content)
+        meta = self._load_meta(target)
+        old_entry = meta["entries"].get(old_h)
+        now = _iso_now()
+
+        if new_h in meta["entries"]:
+            # New content already tracked — just link supersedes and bump last_seen
+            if old_h and old_h != new_h and old_h not in meta["entries"][new_h]["supersedes"]:
+                meta["entries"][new_h]["supersedes"].append(old_h)
+            meta["entries"][new_h]["last_seen"] = now
+        else:
+            first_seen = old_entry["first_seen"] if old_entry else now
+            meta["entries"][new_h] = {
+                "content_hash": _full_hash(new_content),
+                "confidence": _DEFAULT_CONFIDENCE_BY_SOURCE.get(source, 1.0),
+                "first_seen": first_seen,
+                "last_seen": now,
+                "evidence_count": 1,
+                "scope": (old_entry or {}).get("scope", "global"),
+                "source": source,
+                "supersedes": [old_h] if (old_h and old_h != new_h) else [],
+                "decayed": False,
+            }
+        # Drop the old record (supersedes chain is preserved on the new entry)
+        if old_h in meta["entries"] and old_h != new_h:
+            del meta["entries"][old_h]
+        self._save_meta(target, meta)
+
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
@@ -237,8 +426,9 @@ class MemoryStore:
             entries = self._entries_for(target)
             limit = self._char_limit(target)
 
-            # Reject exact duplicates
+            # Reject exact duplicates (but still bump evidence)
             if content in entries:
+                self._meta_add_entry(target, content)
                 return self._success_response(target, "Entry already exists (no duplicate added).")
 
             # Calculate what the new total would be
@@ -261,6 +451,7 @@ class MemoryStore:
             entries.append(content)
             self._set_entries(target, entries)
             self.save_to_disk(target)
+            self._meta_add_entry(target, content, source="user_explicit")
 
         return self._success_response(target, "Entry added.")
 
@@ -300,6 +491,7 @@ class MemoryStore:
                 # All identical -- safe to replace just the first
 
             idx = matches[0][0]
+            old_entry_text = entries[idx]
             limit = self._char_limit(target)
 
             # Check that replacement doesn't blow the budget
@@ -319,6 +511,7 @@ class MemoryStore:
             entries[idx] = new_content
             self._set_entries(target, entries)
             self.save_to_disk(target)
+            self._meta_replace_entry(target, old_entry_text, new_content)
 
         return self._success_response(target, "Entry replaced.")
 
@@ -350,9 +543,11 @@ class MemoryStore:
                 # All identical -- safe to remove just the first
 
             idx = matches[0][0]
+            removed_text = entries[idx]
             entries.pop(idx)
             self._set_entries(target, entries)
             self.save_to_disk(target)
+            self._meta_remove_entry(target, removed_text)
 
         return self._success_response(target, "Entry removed.")
 
