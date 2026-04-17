@@ -459,7 +459,10 @@ class ContextCompressor(ContextEngine):
                 if isinstance(tc, dict):
                     args = tc.get("function", {}).get("arguments", "")
                     if len(args) > 500:
-                        tc = {**tc, "function": {**tc["function"], "arguments": args[:200] + "...[truncated]"}}
+                        # Replace with a valid JSON object — Anthropic's tool_use.input
+                        # must parse to a dict, so a mid-string chop breaks the request.
+                        placeholder = json.dumps({"_truncated": True, "_original_length": len(args)})
+                        tc = {**tc, "function": {**tc["function"], "arguments": placeholder}}
                         modified = True
                 new_tcs.append(tc)
             if modified:
