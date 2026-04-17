@@ -645,12 +645,77 @@ class MemoryStore:
             "success": True,
             "target": target,
             "entries": entries,
+            "entries_meta": self._entries_meta_for(target),
             "usage": f"{pct}% — {current:,}/{limit:,} chars",
             "entry_count": len(entries),
         }
         if message:
             resp["message"] = message
         return resp
+
+    def _entries_meta_for(self, target: str) -> List[Dict[str, Any]]:
+        """Return per-entry metadata aligned by index with _entries_for(target).
+
+        For live entries (present in the .md), emit the sidecar record with its
+        hash id injected. If an entry has no sidecar record (shouldn't happen
+        post-backfill, but defensive), emit a minimal stub marked source=unknown
+        so the response shape is stable.
+
+        Also appends any `decayed=True` entries from the sidecar that are NOT
+        in the live .md — these are superseded rows the model may want to see
+        when reviewing a replace/supersedes chain. They carry decayed=True so
+        callers can filter.
+        """
+        entries = self._entries_for(target)
+        meta = self._load_meta(target)
+        meta_entries = meta.get("entries", {}) or {}
+
+        out: List[Dict[str, Any]] = []
+        live_ids: set = set()
+        for text in entries:
+            h = _hash_id(text)
+            live_ids.add(h)
+            rec = meta_entries.get(h)
+            if rec is None:
+                out.append({
+                    "id": h,
+                    "source": "unknown",
+                    "confidence": 0.0,
+                    "first_seen": "",
+                    "last_seen": "",
+                    "evidence_count": 0,
+                    "supersedes": [],
+                    "decayed": False,
+                })
+            else:
+                out.append({
+                    "id": h,
+                    "source": rec.get("source", "unknown"),
+                    "confidence": rec.get("confidence", 0.0),
+                    "first_seen": rec.get("first_seen", ""),
+                    "last_seen": rec.get("last_seen", ""),
+                    "evidence_count": rec.get("evidence_count", 0),
+                    "supersedes": rec.get("supersedes", []) or [],
+                    "decayed": bool(rec.get("decayed", False)),
+                })
+
+        # Tail: superseded (decayed) rows not in live set — useful for chain inspection
+        for h, rec in meta_entries.items():
+            if h in live_ids:
+                continue
+            if not rec.get("decayed"):
+                continue
+            out.append({
+                "id": h,
+                "source": rec.get("source", "unknown"),
+                "confidence": rec.get("confidence", 0.0),
+                "first_seen": rec.get("first_seen", ""),
+                "last_seen": rec.get("last_seen", ""),
+                "evidence_count": rec.get("evidence_count", 0),
+                "supersedes": rec.get("supersedes", []) or [],
+                "decayed": True,
+            })
+        return out
 
     def _render_block(self, target: str, entries: List[str]) -> str:
         """Render a system prompt block with header and usage indicator."""
