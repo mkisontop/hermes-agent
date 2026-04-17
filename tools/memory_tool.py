@@ -408,7 +408,45 @@ class MemoryStore:
             del meta["entries"][old_h]
         self._save_meta(target, meta)
 
-    def add(self, target: str, content: str) -> Dict[str, Any]:
+    def _quarantine_entry(
+        self,
+        target: str,
+        content: str,
+        reason: str,
+        conflicts_with: Optional[str] = None,
+    ) -> None:
+        """Append the old entry to <TARGET>.quarantine.md and log it in meta.
+
+        Used when replace() overwrites a high-confidence, recent entry — we
+        preserve the old fact for the weekly vacuum to review instead of
+        silently dropping it.
+        """
+        mem_dir = get_memory_dir()
+        if target == "user":
+            q_path = mem_dir / "USER.quarantine.md"
+        else:
+            q_path = mem_dir / "MEMORY.quarantine.md"
+
+        stamp = _iso_now()
+        block = f"\n<!-- quarantined {stamp} reason={reason} -->\n{content}\n"
+        try:
+            q_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(q_path, "a", encoding="utf-8") as f:
+                f.write(block)
+        except OSError as e:
+            logger.warning("Failed to write quarantine file %s: %s", q_path, e)
+            return
+
+        meta = self._load_meta(target)
+        meta.setdefault("quarantine_log", []).append({
+            "id": _hash_id(content),
+            "reason": reason,
+            "quarantined_at": stamp,
+            "conflicts_with": conflicts_with,
+        })
+        self._save_meta(target, meta)
+
+    def add(self, target: str, content: str, source: str = "user_explicit") -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
         if not content:
@@ -451,7 +489,7 @@ class MemoryStore:
             entries.append(content)
             self._set_entries(target, entries)
             self.save_to_disk(target)
-            self._meta_add_entry(target, content, source="user_explicit")
+            self._meta_add_entry(target, content, source=source)
 
         return self._success_response(target, "Entry added.")
 
@@ -511,6 +549,37 @@ class MemoryStore:
             entries[idx] = new_content
             self._set_entries(target, entries)
             self.save_to_disk(target)
+
+            # Quarantine decision: was the old entry high-confidence AND recent?
+            # If so, preserve it for weekly vacuum review instead of silently
+            # overwriting. Thresholds: confidence >= 0.8, age <= 7 days.
+            try:
+                from datetime import datetime, timedelta, timezone
+
+                meta_before = self._load_meta(target)
+                old_h = _hash_id(old_entry_text)
+                old_rec = meta_before.get("entries", {}).get(old_h)
+                if old_rec:
+                    conf = float(old_rec.get("confidence", 0.0))
+                    last_seen_str = old_rec.get("last_seen")
+                    is_recent = False
+                    if last_seen_str:
+                        try:
+                            last_seen = datetime.fromisoformat(last_seen_str)
+                            age = datetime.now(timezone.utc) - last_seen
+                            is_recent = age <= timedelta(days=7)
+                        except ValueError:
+                            pass
+                    if conf >= 0.8 and is_recent:
+                        self._quarantine_entry(
+                            target,
+                            old_entry_text,
+                            reason="contradiction",
+                            conflicts_with=_hash_id(new_content),
+                        )
+            except Exception as e:
+                logger.warning("Quarantine check failed (non-fatal): %s", e)
+
             self._meta_replace_entry(target, old_entry_text, new_content)
 
         return self._success_response(target, "Entry replaced.")
