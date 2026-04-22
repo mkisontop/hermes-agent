@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Hermes-safe Claude Code wrapper — max-intelligence profile.
+#
+# Protects Claude Max subscription OAuth by stripping API-billing env vars
+# that would otherwise take precedence in -p (print) mode.
+# See: Claude Code docs on credential precedence (ANTHROPIC_API_KEY and
+# ANTHROPIC_AUTH_TOKEN override subscription login in non-interactive mode).
+
+# Optional headless subscription OAuth token (only if keychain unavailable).
+if [[ -f "$HOME/.hermes/secrets/claude-code.env" ]]; then
+    # shellcheck disable=SC1090
+    source "$HOME/.hermes/secrets/claude-code.env"
+fi
+
+# Critical billing/auth firewall — these would override Claude Code
+# subscription OAuth in terminal sessions.
+unset ANTHROPIC_API_KEY
+unset ANTHROPIC_AUTH_TOKEN
+unset ANTHROPIC_BASE_URL
+unset ANTHROPIC_MODEL
+unset ANTHROPIC_DEFAULT_HAIKU_MODEL
+unset CLAUDE_CODE_USE_BEDROCK
+unset CLAUDE_CODE_USE_VERTEX
+unset CLAUDE_CODE_USE_FOUNDRY
+
+# Maximum-intelligence profile.
+export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-max}"
+
+# Keep failures bounded. Claude Code default retries are high.
+export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1}"
+
+# Parallelism: enough for speed, not so high that the Mac mini thrashes.
+export CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY="${CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY:-4}"
+
+# Large enough for serious coding results, not so large that every run explodes.
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-16384}"
+
+# Make debug logs explicit when enabled by caller.
+export CLAUDE_CODE_DEBUG_LOGS_DIR="${CLAUDE_CODE_DEBUG_LOGS_DIR:-$HOME/.hermes/logs/claude-code-debug}"
+
+exec claude "$@"

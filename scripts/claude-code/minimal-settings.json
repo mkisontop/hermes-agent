@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "disableAllHooks": true,
+  "permissions": {
+    "allow": [
+      "Read"
+    ],
+    "deny": [
+      "Bash",
+      "Edit",
+      "Write",
+      "WebFetch",
+      "Grep",
+      "Glob",
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./secrets/**)",
+      "Read(./backups/**)",
+      "Read(./logs/**)",
+      "Read(./output/**)",
+      "Read(./proposals/**)",
+      "Read(./.venv/**)",
+      "Read(./venv/**)",
+      "Read(~/.hermes/secrets/**)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)"
+    ]
+  }
+}
