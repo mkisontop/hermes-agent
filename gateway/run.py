@@ -21,6 +21,7 @@ import re
 import shlex
 import sys
 import signal
+import subprocess
 import tempfile
 import threading
 import time
@@ -2762,7 +2763,141 @@ class GatewayRunner:
             return config.get_unauthorized_dm_behavior(platform)
         return "pair"
     
+    async def _maybe_route_to_claude_code(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+    ) -> Optional[str]:
+        """Route planning/coding/review requests through Claude Code when enabled.
+
+        This is Commit 4's *hard routing* hook. It runs before the normal
+        Hermes agent reasoning path, but only when enabled by env toggles.
+
+        Policy:
+        - HERMES_CLAUDE_CODE_CONTROL=1 is the master switch.
+        - Per-route toggles decide which classes of requests are eligible.
+        - planning -> Claude Code plan_minimal
+        - coding   -> Claude Code plan-first only (never patch directly here)
+        - review   -> Claude Code review
+        - normal   -> keep Hermes-native
+
+        Safety:
+        - If the router/delegate fails for planning, return a clear failure
+          message (do not silently pretend the route worked).
+        - If it fails for coding/review, do NOT silently downgrade to GPT-5.4.
+          Return a refusal/failure string instead.
+        - Slash commands are excluded by the caller; only free-text user
+          messages flow through here.
+        """
+        def _env_on(name: str, default: str = "0") -> bool:
+            return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+        if not _env_on("HERMES_CLAUDE_CODE_CONTROL"):
+            return None
+
+        router_path = Path.home() / ".hermes" / "tools" / "hermes_claude_router.py"
+        if not router_path.exists():
+            logger.warning("Claude router enabled but missing: %s", router_path)
+            return (
+                "Claude Code routing is enabled, but the router script is missing. "
+                "Please install `~/.hermes/tools/hermes_claude_router.py` or disable "
+                "`HERMES_CLAUDE_CODE_CONTROL`."
+            )
+
+        message = (event.text or "").strip()
+        if not message:
+            return None
+
+        session_summary = ""
+        try:
+            # Keep the context envelope compact; router should not ingest raw
+            # transcript dumps. Use only a tiny summary if available later.
+            session_summary = ""
+        except Exception:
+            session_summary = ""
+
+        cmd = [
+            str(router_path),
+            "--message", message,
+            "--cwd", os.environ.get("TERMINAL_CWD", str(Path.home())),
+            "--session-summary", session_summary,
+            "--timeout", os.getenv("HERMES_CLAUDE_CODE_TIMEOUT", "3600"),
+        ]
+
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=int(os.getenv("HERMES_CLAUDE_CODE_TIMEOUT", "3600")),
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("Claude router timed out for message route probe")
+            return (
+                "Claude Code routing timed out before a decision was returned. "
+                "Please retry, or disable `HERMES_CLAUDE_CODE_CONTROL` temporarily."
+            )
+        except Exception as e:
+            logger.warning("Claude router subprocess failed: %s", e)
+            return f"Claude Code routing failed to start: {type(e).__name__}: {e}"
+
+        raw = proc.stdout or ""
+        try:
+            routing = json.loads(raw)
+        except Exception as e:
+            logger.warning("Claude router returned invalid JSON: %s", e)
+            preview = raw[:400].replace("\n", " ")
+            return (
+                "Claude Code router returned invalid output, so I won't silently route this request. "
+                f"Preview: {preview}"
+            )
+
+        route_name = str(routing.get("route", "normal"))
+        decision = str(routing.get("decision", "answer"))
+        response = routing.get("response")
+        requires_confirmation = bool(routing.get("requires_user_confirmation", False))
+        confirmation_prompt = routing.get("confirmation_prompt")
+
+        # Route-specific env toggles
+        if route_name == "planning" and not _env_on("HERMES_CLAUDE_CODE_PLAN"):
+            return None
+        if route_name == "coding" and not _env_on("HERMES_CLAUDE_CODE_CODING"):
+            return None
+        if route_name == "review" and not _env_on("HERMES_CLAUDE_CODE_REVIEW"):
+            return None
+
+        if route_name == "normal":
+            return None
+
+        # Safety fallback semantics by route class.
+        if proc.returncode != 0 or decision == "refuse" or response is None:
+            if route_name == "planning":
+                return (
+                    "Claude Code planning is enabled here, but the routed planning run failed. "
+                    "I am not pretending it succeeded. You can retry, inspect the delegate logs, "
+                    "or temporarily disable `HERMES_CLAUDE_CODE_PLAN`."
+                )
+            if route_name == "coding":
+                return (
+                    "Claude Code coding routing failed, so I will not silently patch the repo with GPT-5.4. "
+                    "Please retry the delegated planning step or disable `HERMES_CLAUDE_CODE_CODING` explicitly."
+                )
+            if route_name == "review":
+                return (
+                    "Claude Code review routing failed, so I will not silently downgrade this safety review to GPT-5.4. "
+                    "Please retry or disable `HERMES_CLAUDE_CODE_REVIEW` explicitly."
+                )
+
+        if route_name == "coding" and requires_confirmation:
+            extra = f"\n\n{confirmation_prompt}" if confirmation_prompt else ""
+            return f"{response}{extra}"
+
+        return str(response)
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+
         """
         Handle an incoming message from any platform.
         
@@ -2828,6 +2963,7 @@ class GatewayRunner:
         # forwarded it to the user; now the user's reply goes back via
         # .update_response so the update process can continue.
         _quick_key = self._session_key_for_source(source)
+        _original_command = event.get_command()
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()
@@ -3253,7 +3389,14 @@ class GatewayRunner:
         # Plugin-registered slash commands
         if command:
             try:
-                from hermes_cli.plugins import get_plugin_command_handler
+                from hermes_cli.plugins import discover_plugins, get_plugin_command_handler
+                # Ensure user/project plugins are actually loaded in gateway
+                # processes before command lookup. Without this, plugins that
+                # register slash commands (like /md) exist on disk but remain
+                # invisible until some unrelated CLI path happens to call
+                # discover_plugins(). Gateway processes need their own lazy
+                # discovery here.
+                discover_plugins()
                 # Normalize underscores to hyphens so Telegram's underscored
                 # autocomplete form matches plugin commands registered with
                 # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
@@ -3264,7 +3407,22 @@ class GatewayRunner:
                     result = plugin_handler(user_args)
                     if _aio.iscoroutine(result):
                         result = await result
-                    return str(result) if result else None
+                    # Dict-return protocol: plugin can ask the gateway to rewrite
+                    # event.text and fall through to the agent (same pattern skill
+                    # commands use). Shape: {"fallthrough_text": "<new event.text>"}.
+                    # Any other dict keys are ignored. If absent or falsy, we fall
+                    # back to the legacy string-reply behavior.
+                    if isinstance(result, dict):
+                        ft = result.get("fallthrough_text")
+                        if ft:
+                            event.text = str(ft)
+                            command = None  # no longer a command; agent handles free text
+                            # fall through past the rest of the command dispatcher
+                        else:
+                            reply = result.get("reply")
+                            return str(reply) if reply else None
+                    else:
+                        return str(result) if result else None
             except Exception as e:
                 logger.debug("Plugin command dispatch failed (non-fatal): %s", e)
 
@@ -3335,6 +3493,16 @@ class GatewayRunner:
         # Pending exec approvals are handled by /approve and /deny commands above.
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
+
+        # Commit 4: optional hard routing to Claude Code before normal Hermes
+        # reasoning. Exclude slash commands — only free-text user messages route
+        # through this hook. Coding/review failures must NOT silently downgrade
+        # to GPT-5.4; _maybe_route_to_claude_code returns explicit user-facing
+        # failure text in that case.
+        if not _original_command and not getattr(event, "internal", False):
+            _claude_routed = await self._maybe_route_to_claude_code(event, source)
+            if _claude_routed is not None:
+                return _claude_routed
 
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
