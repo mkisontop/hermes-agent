@@ -27,6 +27,79 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), [Open
 
 ---
 
+## Claude Code integration
+
+Hermes now supports a **Claude Code delegation architecture** for hard planning, coding, and review work while keeping Hermes itself as the orchestrator.
+
+High-level split:
+
+```text
+Hermes = memory, tools, policy, execution, gateways
+Claude Code = planning, coding, review brain
+GPT-5.4 = thin router / summarizer / policy layer
+```
+
+This means:
+- normal conversation, memory, messaging, scheduling, and tool use remain Hermes-native
+- planning / design / architecture can be routed to Claude Code `plan_minimal` or `plan_files`
+- coding flows are `plan_minimal` first, then confirmation, then `patch_worktree`
+- review / safety audit goes to Claude Code `review`
+
+### Safety model
+
+Claude Code is invoked only through a wrapper and delegate under `~/.hermes/`:
+
+- `~/.hermes/bin/hermes-claude-opus-max`
+- `~/.hermes/tools/claude_code_delegate.py`
+- `~/.hermes/tools/hermes_claude_router.py`
+
+The wrapper strips Anthropic API-billing variables so Claude Code stays on the Claude Max subscription auth path instead of accidentally falling back to API-key billing.
+
+The delegate exposes canonical bounded profiles:
+- `smoke`
+- `plan_minimal`
+- `plan_files`
+- `patch_worktree`
+- `review`
+
+The hard-routing hook is env-gated inside the gateway, so nothing changes unless you explicitly enable it:
+
+```bash
+export HERMES_CLAUDE_CODE_CONTROL=1
+export HERMES_CLAUDE_CODE_PLAN=1
+export HERMES_CLAUDE_CODE_CODING=1
+export HERMES_CLAUDE_CODE_REVIEW=1
+```
+
+If Claude Code routing fails:
+- planning returns an explicit failure
+- coding does **not** silently patch with GPT-5.4
+- review does **not** silently downgrade to GPT-5.4 safety review
+
+### Use cases
+
+Use Claude Code for:
+- planning
+- architecture
+- coding
+- debugging
+- refactoring
+- repo review
+- safety review
+
+Keep Hermes-native for:
+- memory recall
+- messaging / calendar / email
+- routine automation
+- normal chat
+- cron / orchestration / proposal lifecycle UI
+
+See the full integration guide at:
+
+- `~/.hermes/claude-code/README.md`
+
+---
+
 ## Quick Install
 
 ```bash
