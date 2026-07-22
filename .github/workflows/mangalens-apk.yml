@@ -2,7 +2,7 @@ name: mangalens-apk
 
 on:
   push:
-    branches: ["main", "claude/live-manga-translator-android-a3dhi8"]
+    branches: ["main", "claude/**"]
     paths: ["mangalens/**", ".github/workflows/mangalens-apk.yml"]
   workflow_dispatch:
 
