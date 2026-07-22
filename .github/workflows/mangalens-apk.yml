@@ -1,0 +1,32 @@
+name: mangalens-apk
+
+on:
+  push:
+    branches: ["main", "claude/live-manga-translator-android-a3dhi8"]
+    paths: ["mangalens/**", ".github/workflows/mangalens-apk.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mangalens
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Build debug APK
+        run: ./gradlew --no-daemon :app:assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MangaLens-apk
+          path: mangalens/app/build/outputs/apk/debug/*.apk
