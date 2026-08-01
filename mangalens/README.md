@@ -1,5 +1,10 @@
 # MangaLens 文A
 
+> **Moved:** MangaLens now lives in its own repository —
+> **[github.com/mkisontop/mangalens](https://github.com/mkisontop/mangalens)** —
+> with releases, a website and an issue tracker. This copy is frozen at
+> 0.9.0 and kept for history; all development continues there.
+
 **Live on-screen translation for raw manhwa, manga and manhua on Android.**
 
 Read raws in Brave (or any app). MangaLens watches your screen, finds the speech
